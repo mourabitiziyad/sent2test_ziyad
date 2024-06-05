@@ -1,0 +1,4 @@
+/venv
+predictions_and_ref_data/*
+output_images/*
+test_images/*
