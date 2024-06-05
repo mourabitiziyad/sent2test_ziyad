@@ -1,6 +1,6 @@
 import os
 import numpy as np
-from keras.models import Model
+from keras.models import Model, load_model
 from keras.layers import Input, Conv2D, Activation, BatchNormalization, MaxPooling2D, AveragePooling2D, Concatenate, Dropout
 import rasterio
 import matplotlib.pyplot as plt
@@ -86,37 +86,60 @@ def load_image(image_path):
 def normalize_image(image):
     return (image - np.min(image)) / (np.max(image) - np.min(image))
 
+# Pad image channels to 10
+def pad_image_channels(image, target_channels=10):
+    current_channels = image.shape[0]
+    if current_channels < target_channels:
+        padding_shape = (target_channels - current_channels, image.shape[1], image.shape[2])
+        padding = np.zeros(padding_shape, dtype=image.dtype)
+        image = np.concatenate((image, padding), axis=0)
+    elif current_channels > target_channels:
+        image = image[:target_channels, :, :]
+    return image
+
 # Extract patches
-def extract_patches(image, patch_size=128):
-    step = patch_size
+def extract_patches(image, patch_size=128, step=128):
+    # Transpose the image to shape (height, width, channels)
+    image = image.transpose(1, 2, 0)
+    
+    # Define the window shape for patches
+    window_shape = (patch_size, patch_size, image.shape[2])
 
-    # Calculate padding
-    pad_height = (patch_size - (image.shape[1] % patch_size)) % patch_size
-    pad_width = (patch_size - (image.shape[2] % patch_size)) % patch_size
-
-    print(f"Original shape: {image.shape}")
-    print(f"Padding height: {pad_height}, Padding width: {pad_width}")
-
-    # Pad the image
-    padded_image = np.pad(image, 
-                          ((0, 0), (0, pad_height), (0, pad_width)), 
-                          mode='reflect')
-
-    print(f"Padded shape: {padded_image.shape}")
-
-    # Extract patches
-    patches = view_as_windows(padded_image.transpose(1, 2, 0), (patch_size, patch_size, 10), step)
-    patches = patches.reshape(-1, patch_size, patch_size, 10)
-
-    print(f"Patches shape: {patches.shape}")
-
-    return patches, padded_image.shape
+    # Extract patches using view_as_windows
+    B = view_as_windows(image, window_shape, step)
+    
+    # Reshape patches to the desired format
+    patches = B.reshape(-1, window_shape[0], window_shape[1], window_shape[2])
+    
+    # Get the dimensions of the final map
+    R = B.shape[0]
+    C = B.shape[1]
+    
+    print(f"Extracted patches shape: {patches.shape}")
+    
+    return patches, R, C
 
 # Save the prediction as a GeoTIFF file
 def save_prediction_as_tiff(prediction, profile, output_path):
-    profile.update(dtype=rasterio.uint8, count=1)
+    # Check if the prediction is single-channel or multi-channel
+    if len(prediction.shape) == 2:
+        profile.update(dtype=rasterio.uint8, count=1)
+        prediction = np.expand_dims(prediction, axis=2)
+    else:
+        profile.update(dtype=rasterio.uint8, count=prediction.shape[2])
+
     with rasterio.open(output_path, 'w', **profile) as dst:
-        dst.write(prediction, 1)
+        for i in range(prediction.shape[2]):
+            dst.write(prediction[:, :, i], i + 1)
+
+def pro_from_x(mapR, mapC, y, padding):
+    mapPatch_shape = y.shape[1]
+    B_ = np.reshape(y, (mapR, mapC, y.shape[1], y.shape[2], y.shape[-1]))
+    C = np.zeros((B_.shape[0] * B_.shape[2], B_.shape[1] * B_.shape[3], B_.shape[4]), dtype=float)
+    for dim in np.arange(B_.shape[4]):
+        B_1 = B_[:, :, :, :, dim]
+        C[:, :, dim] = B_1.transpose(0, 2, 1, 3).reshape(-1, B_1.shape[1] * B_1.shape[3])
+    return C, mapPatch_shape
 
 # Define input and output directories
 input_dir = 'test_images'
@@ -124,67 +147,69 @@ output_dir = 'new_output_images'
 os.makedirs(output_dir, exist_ok=True)
 
 # List all TIFF files in the input directory
-image_paths = [os.path.join(input_dir, file) for file in os.listdir(input_dir)]
+image_paths = [os.path.join(input_dir, file) for file in os.listdir(input_dir) if file.endswith('.tiff')]
+
+# Define the patch size and padding list
+patch_shape = (128, 128, 10)
+step = patch_shape[0]
+params = {'dim_x': patch_shape[0],
+          'dim_y': patch_shape[1],
+          'dim_z': patch_shape[2],
+          'step': step,
+          'Bands': [1, 2, 3, 4, 5, 6, 7, 8, 11, 12],
+          'scale': 10000.0,
+          'nanValu': 999}
+
+dim_x = params['dim_x']
+if dim_x == 32:
+    paddList = [0, 8, 16, 24]
+elif dim_x == 64:
+    paddList = [0, 16, 32, 48]
+else:
+    paddList = [0, 32, 64, 96]
 
 # Process each image
 for image_path in image_paths:
     print(f"Processing {image_path}")
-    
+
     # Load the image
     images, profile = load_image(image_path)
 
     # Normalize the image
     normalized_images = normalize_image(images)
+    
+    # Pad the image channels to 10
+    padded_images = pad_image_channels(normalized_images)
 
-    # Extract patches
-    patches, padded_shape = extract_patches(normalized_images)
+    Pro = None
 
-    # Predict using the pre-trained model
-    predictions = model.predict(patches, batch_size=16, verbose=1)
+    # Process each padding
+    for padding in paddList:
+        if padding == 0:
+            img1 = padded_images
+        else:
+            img1 = np.pad(padded_images, ((0, 0), (padding, 0), (padding, 0)), 'reflect')
 
-    print(f"Predictions shape: {predictions.shape}")
+        print(f"Padded shape: {img1.shape}")
 
-    # Set the downsampling factor based on the model architecture
-    downsample_factor = patches.shape[1] // predictions.shape[1]  # Determine the downsampling factor
-    patch_size_out = patches.shape[1] // downsample_factor  # Output patch size
+        # Extract patches
+        patches, mapR, mapC = extract_patches(img1, patch_size=dim_x, step=dim_x)
 
-    num_patches_y = padded_shape[1] // patches.shape[1]
-    num_patches_x = padded_shape[2] // patches.shape[2]
-    num_channels = predictions.shape[-1]
+        # Predict using the pre-trained model
+        predictions = model.predict(patches, batch_size=16, verbose=1)
 
-    print(f"Number of patches (y, x): {num_patches_y}, {num_patches_x}")
-    print(f"Number of channels: {num_channels}")
-    print(f"Output patch size: {patch_size_out}")
+        print(f"Predictions shape: {predictions.shape}")
 
-    # Verify the total number of elements
-    total_elements = num_patches_y * num_patches_x * patch_size_out * patch_size_out * num_channels
-    print(f"Total elements expected: {total_elements}")
-    print(f"Total elements in predictions: {predictions.size}")
+        # Process predictions to match the original method
+        C, mapPatch_shape = pro_from_x(mapR, mapC, predictions, padding)
+        OS = int(dim_x / mapPatch_shape)
 
-    assert total_elements == predictions.size, "Mismatch in the total number of elements for reshaping."
+        if padding == 0:
+            r, c = C.shape[:2]
+            Pro = C[:r - mapPatch_shape, :c - mapPatch_shape, :]
+        else:
+            Pro += C[int(padding / OS):r - mapPatch_shape + int(padding / OS), int(padding / OS):c - mapPatch_shape + int(padding / OS), :]
 
-    # Reshape predictions to the padded image shape
-    predicted_padded_image = predictions.reshape((num_patches_y, num_patches_x, patch_size_out, patch_size_out, num_channels))
-
-    # Reconstruct the predicted image
-    predicted_image = np.block([[predicted_padded_image[i, j, :, :, 0] for j in range(predicted_padded_image.shape[1])] for i in range(predicted_padded_image.shape[0])])
-
-    # Remove padding
-    predicted_image = predicted_image[:normalized_images.shape[1], :normalized_images.shape[2]]
-
-    # Apply a threshold to the predicted image to get binary segmentation
-    thresholds = [0.001, 0.01, 0.1]
-    for threshold in thresholds:
-
-        binary_predicted_image = (predicted_image > threshold).astype(np.uint8)
-
-        # Save the prediction as a GeoTIFF file
-        output_path = os.path.join(output_dir, f'{os.path.splitext(os.path.basename(image_path))[0]}_binary_predicted_segmentation_threshold_{threshold}_new.tif')
-        save_prediction_as_tiff(binary_predicted_image, profile, output_path)
-
-        # Visualize the prediction
-        plt.figure(figsize=(10, 10))
-        plt.imshow(binary_predicted_image, cmap='gray')
-        plt.colorbar(label='Prediction')
-        plt.title(f'Binary Predicted Segmentation (Threshold: {threshold})')
-        plt.show()
+    # Save the prediction as a GeoTIFF file
+    output_path = os.path.join(output_dir, f'{os.path.splitext(os.path.basename(image_path))[0]}_predicted.tif')
+    save_prediction_as_tiff(Pro, profile, output_path)
