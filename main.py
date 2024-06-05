@@ -6,44 +6,62 @@ import rasterio
 import matplotlib.pyplot as plt
 from skimage.util.shape import view_as_windows
 
-def sen2IS_net_bn(input_size=(128, 128, 10), num_classes=2):
+def sen2IS_net_bn_core(inputs, dim=16, inc_rate=2, bn=1):
+    conv0 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(inputs)
+    if bn == 1:
+        conv0 = BatchNormalization(axis=-1)(conv0)
+    conv0 = Activation('relu')(conv0)
+    conv0 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(conv0)
+    if bn == 1:
+        conv0 = BatchNormalization(axis=-1)(conv0)
+    conv0 = Activation('relu')(conv0)
+
+    dim = dim * inc_rate
+    conv1 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(conv0)
+    if bn == 1:
+        conv1 = BatchNormalization(axis=-1)(conv1)
+    conv1 = Activation('relu')(conv1)
+    conv1 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(conv1)
+    if bn == 1:
+        conv1 = BatchNormalization(axis=-1)(conv1)
+    conv1 = Activation('relu')(conv1)
+
+    pool1 = MaxPooling2D((2, 2))(conv1)
+    pool2 = AveragePooling2D((2, 2))(conv1)
+    merge1 = Concatenate()([pool1, pool2])
+
+    return merge1
+
+def sen2IS_net_bn_core_2(merge1, dim=128, inc_rate=2, numC=2, bn=1, attentionS=0, attentionC=0):
+    conv2 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(merge1)
+    if bn == 1:
+        conv2 = BatchNormalization(axis=-1)(conv2)
+    conv2 = Activation('relu')(conv2)
+    conv2 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(conv2)
+    if bn == 1:
+        conv2 = BatchNormalization(axis=-1)(conv2)
+    conv2 = Activation('relu')(conv2)
+    drop0 = Dropout(0.1)(conv2)
+
+    dim = dim * inc_rate
+    conv3 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(drop0)
+    if bn == 1:
+        conv3 = BatchNormalization(axis=-1)(conv3)
+    conv3 = Activation('relu')(conv3)
+    conv3 = Conv2D(dim, (3, 3), padding='same', kernel_initializer='he_normal')(conv3)
+    if bn == 1:
+        conv3 = BatchNormalization(axis=-1)(conv3)
+    conv3 = Activation('relu')(conv3)
+    drop1 = Dropout(0.1)(conv3)
+
+    o = Conv2D(numC, (1, 1), padding='same', activation='softmax')(drop1)
+    return o
+
+def sen2IS_net_bn(input_size=(128, 128, 10), numC=2, ifBN=0, attentionS=0, attentionC=0):
     inputs = Input(input_size)
-    
-    # First block
-    x = Conv2D(16, (3, 3), padding='same', kernel_initializer='he_normal')(inputs)
-    x = Activation('relu')(x)
-    x = Conv2D(16, (3, 3), padding='same', kernel_initializer='he_normal')(x)
-    x = Activation('relu')(x)
-    
-    # Second block
-    x = Conv2D(32, (3, 3), padding='same', kernel_initializer='he_normal')(x)
-    x = Activation('relu')(x)
-    x = Conv2D(32, (3, 3), padding='same', kernel_initializer='he_normal')(x)
-    x = Activation('relu')(x)
-    
-    pool1 = MaxPooling2D((2, 2))(x)
-    pool2 = AveragePooling2D((2, 2))(x)
-    x = Concatenate()([pool1, pool2])
-    
-    # Third block
-    x = Conv2D(128, (3, 3), padding='same', kernel_initializer='he_normal')(x)
-    x = Activation('relu')(x)
-    x = Conv2D(128, (3, 3), padding='same', kernel_initializer='he_normal')(x)
-    x = Activation('relu')(x)
-    x = Dropout(0.1)(x)
-    
-    # Fourth block
-    x = Conv2D(256, (3, 3), padding='same', kernel_initializer='he_normal')(x)
-    x = Activation('relu')(x)
-    x = Conv2D(256, (3, 3), padding='same', kernel_initializer='he_normal')(x)
-    x = Activation('relu')(x)
-    x = Dropout(0.1)(x)
-    
-    # Output layer
-    outputs = Conv2D(num_classes, (1, 1), padding='same', activation='softmax')(x)
-    
-    model = Model(inputs, outputs)
-    
+    merge1 = sen2IS_net_bn_core(inputs, bn=ifBN)
+    o = sen2IS_net_bn_core_2(merge1, dim=128, inc_rate=2, numC=numC, bn=ifBN, attentionS=attentionS, attentionC=attentionC)
+    model = Model(inputs=inputs, outputs=o)
     return model
 
 # Instantiate the model
@@ -102,7 +120,7 @@ def save_prediction_as_tiff(prediction, profile, output_path):
 
 # Define input and output directories
 input_dir = 'test_images'
-output_dir = 'output_images'
+output_dir = 'new_output_images'
 os.makedirs(output_dir, exist_ok=True)
 
 # List all TIFF files in the input directory
@@ -122,7 +140,7 @@ for image_path in image_paths:
     patches, padded_shape = extract_patches(normalized_images)
 
     # Predict using the pre-trained model
-    predictions = model.predict(patches)
+    predictions = model.predict(patches, batch_size=16, verbose=1)
 
     print(f"Predictions shape: {predictions.shape}")
 
@@ -161,7 +179,7 @@ for image_path in image_paths:
         binary_predicted_image = (predicted_image > threshold).astype(np.uint8)
 
         # Save the prediction as a GeoTIFF file
-        output_path = os.path.join(output_dir, f'{os.path.splitext(os.path.basename(image_path))[0]}_binary_predicted_segmentation_threshold_{threshold}.tif')
+        output_path = os.path.join(output_dir, f'{os.path.splitext(os.path.basename(image_path))[0]}_binary_predicted_segmentation_threshold_{threshold}_new.tif')
         save_prediction_as_tiff(binary_predicted_image, profile, output_path)
 
         # Visualize the prediction
